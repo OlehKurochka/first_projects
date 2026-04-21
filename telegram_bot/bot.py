@@ -37,9 +37,10 @@ logger = logging.getLogger(__name__)
 (
     SET_BUDGET,
     ADD_AMOUNT, ADD_DESC,
-    SET_LIMIT_CAT, SET_LIMIT_AMOUNT,
+    SET_LIMIT_CAT, SET_LIMIT_AMOUNT,          # SET_LIMIT_CAT тепер текстовий
     ADD_INCOME_AMOUNT, ADD_INCOME_DESC,
-) = range(7)
+    DELETE_CONFIRM,                            # власний стейт для /delete
+) = range(8)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DATA_FILE          = "budget_data.json"
@@ -334,50 +335,59 @@ async def setbudget_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /setlimit — ліміт на категорію
+# /setlimit — ліміт на категорію (ТЕКСТОВИЙ вибір — без CallbackQuery в станах)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _cat_list_text(limits: dict) -> str:
+    """Повертає пронумерований список категорій для відправки в чат."""
+    lines = []
+    for i, cat in enumerate(CATEGORIES, 1):
+        mark = f" ✅ ліміт: {fmt(limits[cat])}" if cat in limits else ""
+        lines.append(f"{i}. {cat}{mark}")
+    return "\n".join(lines)
+
 
 async def setlimit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data  = load_data()
     group = get_group(data, str(update.effective_chat.id))
     limits = group.get("category_limits", {})
 
-    # будуємо клавіатуру 2 стовпці
-    keyboard, row = [], []
-    for cat in CATEGORIES:
-        label = f"{cat} ✓" if cat in limits else cat
-        row.append(InlineKeyboardButton(label, callback_data=f"lcat_{cat}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-
-    await update.message.reply_text(
-        "🔒 Виберіть категорію для встановлення тижневого ліміту:\n"
-        "_(✓ — ліміт вже встановлено)_",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+    text = (
+        "🔒 *Встановлення ліміту витрат*\n\n"
+        "Введіть *номер* категорії:\n\n"
+        f"{_cat_list_text(limits)}\n\n"
+        "_Або /cancel для скасування_"
     )
+    await update.message.reply_text(text, parse_mode="Markdown")
     return SET_LIMIT_CAT
 
 
-async def setlimit_cat_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def setlimit_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отримуємо номер категорії, яку ввів користувач."""
+    text = update.message.text.strip()
+    try:
+        idx = int(text)
+        if not (1 <= idx <= len(CATEGORIES)):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ Введіть число від 1 до {len(CATEGORIES)}, наприклад: *3*",
+            parse_mode="Markdown",
+        )
+        return SET_LIMIT_CAT
 
-    cat = query.data.removeprefix("lcat_")
+    cat = CATEGORIES[idx - 1]
     context.user_data["limit_category"] = cat
 
     data  = load_data()
     group = get_group(data, str(update.effective_chat.id))
     cur   = group["category_limits"].get(cat)
-    cur_text = f" (зараз: *{fmt(cur)}*)" if cur else ""
+    cur_text = f"\nПоточний ліміт: *{fmt(cur)}*" if cur else ""
 
-    await query.edit_message_text(
-        f"🔒 Категорія: *{cat}*{cur_text}\n\n"
-        "Введіть ліміт витрат на тиждень (₴):\n"
-        "_Введіть 0, щоб скасувати ліміт_",
+    await update.message.reply_text(
+        f"📂 Категорія: *{cat}*{cur_text}\n\n"
+        "Введіть тижневий ліміт витрат (₴):\n"
+        "_Введіть 0 — щоб скасувати ліміт_",
         parse_mode="Markdown",
     )
     return SET_LIMIT_AMOUNT
@@ -398,11 +408,13 @@ async def setlimit_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if amount == 0:
         group["category_limits"].pop(cat, None)
-        await update.message.reply_text(f"✅ Ліміт для *{cat}* скасовано.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"🗑 Ліміт для *{cat}* скасовано.", parse_mode="Markdown"
+        )
     else:
         group["category_limits"][cat] = amount
         await update.message.reply_text(
-            f"✅ Ліміт для *{cat}* — *{fmt(amount)}* на тиждень 🔒",
+            f"✅ Ліміт для *{cat}* встановлено: *{fmt(amount)}/тиждень* 🔒",
             parse_mode="Markdown",
         )
     save_data(data)
@@ -712,10 +724,10 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /delete
+# /delete — видалити останню витрату (власний ConversationHandler)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     data    = load_data()
     group   = get_group(data, str(update.effective_chat.id))
@@ -723,12 +735,14 @@ async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     my_exp = [e for e in group["expenses"] if e["user_id"] == user_id]
     if not my_exp:
         await update.message.reply_text("❌ У тебе немає витрат для видалення.")
-        return
+        return ConversationHandler.END
 
     last = my_exp[-1]
-    kb   = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Так, видалити", callback_data=f"del_{last['id']}"),
-        InlineKeyboardButton("❌ Скасувати",     callback_data="del_cancel"),
+    context.user_data["delete_expense_id"] = last["id"]
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Так, видалити", callback_data="del_yes"),
+        InlineKeyboardButton("❌ Скасувати",     callback_data="del_no"),
     ]])
     await update.message.reply_text(
         f"🗑 Видалити останню витрату?\n\n"
@@ -737,31 +751,37 @@ async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=kb,
     )
+    return DELETE_CONFIRM
 
 
-async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def delete_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "del_cancel":
+    if query.data == "del_no":
         await query.edit_message_text("❌ Видалення скасовано.")
-        return
+        return ConversationHandler.END
 
-    expense_id = int(query.data.removeprefix("del_"))
-    data       = load_data()
-    group      = get_group(data, str(update.effective_chat.id))
-    before     = len(group["expenses"])
+    expense_id = context.user_data.get("delete_expense_id")
+    if expense_id is None:
+        await query.edit_message_text("❌ Помилка: витрату не знайдено.")
+        return ConversationHandler.END
+
+    data  = load_data()
+    group = get_group(data, str(update.effective_chat.id))
+    before = len(group["expenses"])
     group["expenses"] = [e for e in group["expenses"] if e["id"] != expense_id]
 
     if len(group["expenses"]) == before:
-        await query.edit_message_text("❌ Витрату не знайдено.")
-        return
+        await query.edit_message_text("❌ Витрату вже було видалено раніше.")
+        return ConversationHandler.END
 
     save_data(data)
     await query.edit_message_text(
-        f"✅ Витрату видалено.\n\n💚 Новий залишок: *{fmt(remaining(group))}*",
+        f"✅ Витрату видалено.\n💚 Новий залишок: *{fmt(remaining(group))}*",
         parse_mode="Markdown",
     )
+    return ConversationHandler.END
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -858,22 +878,25 @@ async def main():
 
     app = Application.builder().token(token).build()
 
-    # ── Conversations ──────────────────────────────────────────────────────────
+    # ── Conversations (реєструємо ПЕРШИМИ, щоб мати пріоритет над глобальними) ─
     budget_conv = ConversationHandler(
         entry_points=[CommandHandler("setbudget", setbudget_start)],
         states={
             SET_BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, setbudget_receive)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
+    # /setlimit — тільки MessageHandler-и (жодних CallbackQuery у станах)
     limit_conv = ConversationHandler(
         entry_points=[CommandHandler("setlimit", setlimit_start)],
         states={
-            SET_LIMIT_CAT:    [CallbackQueryHandler(setlimit_cat_cb, pattern=r"^lcat_")],
+            SET_LIMIT_CAT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, setlimit_cat)],
             SET_LIMIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, setlimit_amount)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     add_conv = ConversationHandler(
@@ -883,6 +906,7 @@ async def main():
             ADD_DESC:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_desc)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     income_conv = ConversationHandler(
@@ -892,22 +916,36 @@ async def main():
             ADD_INCOME_DESC:   [MessageHandler(filters.TEXT & ~filters.COMMAND, income_desc)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
-    # ── Handlers ───────────────────────────────────────────────────────────────
+    # /delete — власний ConversationHandler з CallbackQuery у своєму стані
+    delete_conv = ConversationHandler(
+        entry_points=[CommandHandler("delete", delete_start)],
+        states={
+            DELETE_CONFIRM: [
+                CallbackQueryHandler(delete_confirm_cb, pattern=r"^del_(yes|no)$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    # ── Спочатку — всі ConversationHandlers ──────────────────────────────────
+    app.add_handler(budget_conv)
+    app.add_handler(limit_conv)
+    app.add_handler(add_conv)
+    app.add_handler(income_conv)
+    app.add_handler(delete_conv)
+
+    # ── Потім — звичайні команди та глобальні хендлери ───────────────────────
     app.add_handler(CommandHandler("start",      start))
     app.add_handler(CommandHandler("help",       help_cmd))
     app.add_handler(CommandHandler("stats",      stats))
     app.add_handler(CommandHandler("categories", categories_stats))
     app.add_handler(CommandHandler("my",         my_stats))
     app.add_handler(CommandHandler("history",    history))
-    app.add_handler(CommandHandler("delete",     delete_last))
     app.add_handler(CommandHandler("ai",         ai_analysis))
-    app.add_handler(CallbackQueryHandler(delete_callback, pattern=r"^del_"))
-    app.add_handler(budget_conv)
-    app.add_handler(limit_conv)
-    app.add_handler(add_conv)
-    app.add_handler(income_conv)
 
     logger.info("🤖 Бот запущено!")
     async with app:
